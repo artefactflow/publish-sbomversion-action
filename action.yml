@@ -1,0 +1,90 @@
+# Marketplace requires action.yml at the repository root, which is why this action lives in its own repository.
+name: 'ArtefactFlow Publish SBOM Version'
+description: 'Create a version of an ArtefactFlow SBOM from your release pipeline, capturing which artefact versions belong together in this release.'
+author: 'ArtefactFlow'
+
+branding:
+  icon: 'layers'
+  color: 'blue'
+
+# Every input can also be supplied as an ARTEFACTFLOW_-prefixed environment variable, so one job-level `env:` block can configure every step. A `with:` value always wins over the variable.
+#
+# No input declares a `default:`. The runner substitutes a declared default before the action runs, which would make the input non-empty and the environment variable unreachable; every default is applied by the action itself instead.
+inputs:
+  api-url:
+    description: 'Base URL of the ArtefactFlow API. Defaults to https://api.artefactflow.app; override it only if you have been given a different endpoint. Environment variable: ARTEFACTFLOW_API_URL.'
+    required: false
+  client-id:
+    description: "A service account's client id: the account's own id, a UUID. Environment variable: ARTEFACTFLOW_CLIENT_ID."
+    required: true
+  client-secret:
+    description: "The service account's client secret. Pass it from a secret and never inline it in the workflow file. Environment variable: ARTEFACTFLOW_CLIENT_SECRET."
+    required: true
+  sbom-name:
+    description: 'The SBOM name. Exact and case-sensitive, 4 to 128 characters of letters, digits, underscores, and hyphens. Environment variable: ARTEFACTFLOW_SBOM_NAME.'
+    required: true
+  version:
+    description: 'The SemVer version to create, for example 1.2.3. Unique within the SBOM. Environment variable: ARTEFACTFLOW_VERSION.'
+    required: true
+
+  release-status:
+    description: "Whether to create the version as `released` or as a `draft`. Defaults to `released`, the one-shot pipeline flow: a released version is frozen immediately and does not contend for the single draft slot an SBOM allows. Environment variable: ARTEFACTFLOW_RELEASE_STATUS."
+    required: false
+  components:
+    description: 'Artefact versions to pin, one `artefact-id[=version]` per line. Every artefact left out (and every artefact with no version given) resolves to its latest stable version, so a partial list is a set of overrides rather than a subset of the SBOM. Each artefact must already be a component of the SBOM. Environment variable: ARTEFACTFLOW_COMPONENTS.'
+    required: false
+  components-file:
+    description: 'Path to a JSON file holding the same pins, for pipelines that generate them. See examples/components.json. Mutually exclusive with `components`. Environment variable: ARTEFACTFLOW_COMPONENTS_FILE.'
+    required: false
+
+  base-version:
+    description: 'SemVer of an existing version to fork from, for branching and hotfix workflows. Environment variable: ARTEFACTFLOW_BASE_VERSION.'
+    required: false
+  bom-ref:
+    description: 'CycloneDX bom-ref identifying this version. A UUID is generated when it is omitted, and the value is immutable once the version exists. Environment variable: ARTEFACTFLOW_BOM_REF.'
+    required: false
+  note:
+    description: 'Free-text note recorded on the version, such as a short release summary. At most 4096 characters. Environment variable: ARTEFACTFLOW_NOTE.'
+    required: false
+  hotfix-flag:
+    description: 'Mark this version as a temporary hotfix. Defaults to false. Environment variable: ARTEFACTFLOW_HOTFIX_FLAG.'
+    required: false
+  compliance-status:
+    description: 'Compliance state of this release: compliant, pending, review, or non_compliant. Environment variable: ARTEFACTFLOW_COMPLIANCE_STATUS.'
+    required: false
+  lifecycles:
+    description: 'CycloneDX lifecycle phases this BOM covers, one per line or comma-separated: design, build, operations, discovery, decommission, end-of-life. Environment variable: ARTEFACTFLOW_LIFECYCLES.'
+    required: false
+  deployed-envs:
+    description: 'Environments this release is deployed to, as environment ids (UUIDs), one per line or comma-separated. Environment variable: ARTEFACTFLOW_DEPLOYED_ENVS.'
+    required: false
+  external-references:
+    description: 'Typed links to record on the version, one `type url [comment]` per line, for example `build-system https://github.com/acme/repo/actions/runs/42 CI run`. A link to this workflow run is added automatically unless you supply a build-system reference yourself. The SBOM version body has no commit or build fields of its own, so this is where that provenance goes. Environment variable: ARTEFACTFLOW_EXTERNAL_REFERENCES.'
+    required: false
+
+  if-exists:
+    description: 'What to do when the version already exists: fail (default) reports an error, skip treats it as success and leaves the existing version untouched. Environment variable: ARTEFACTFLOW_IF_EXISTS.'
+    required: false
+
+outputs:
+  version:
+    description: 'The SemVer version that was published.'
+  version-url:
+    description: "API URL of the version. Taken from the create response's Location header, or derived from api-url when the API does not send one."
+  sbom-name:
+    description: 'The SBOM the version was created on.'
+  release-status:
+    description: 'The release status the version was created with: released or draft.'
+  created:
+    description: 'true when this run created the version; false when it already existed and if-exists was skip.'
+  components:
+    description: 'The resolved component set as JSON: one entry per artefact in the SBOM with the version that was captured. With auto-resolution this is the only way a workflow learns which artefact versions the release actually pinned.'
+
+runs:
+  using: 'docker'
+  # Built from source on the runner until the first release publishes an image. From then on this references one exact, immutable image version, which is bumped as part of cutting a release:
+  #
+  #   image: 'docker://ghcr.io/artefactflow/publish-sbomversion-action:1.2.3'
+  #
+  # Exact, not a floating `:1`. A consumer who pins `uses: ...@v1.2.0` or a commit SHA expects to keep running that code; a floating tag would silently hand them a newer image and make pinning meaningless. The release workflow refuses to publish if this reference and the release tag disagree.
+  image: 'Dockerfile'

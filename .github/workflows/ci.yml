@@ -1,0 +1,323 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes the run already in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  image:
+    name: Build image
+    # The action is a container action, so a Dockerfile that no longer builds breaks every consumer. Validate it on every change; nothing is pushed here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: publish-sbomversion-action:ci
+
+  action:
+    name: Action metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Marketplace rejects a release whose action.yml is malformed, and it does so only at publish time. Catching it here keeps that failure off the release path.
+      - name: Validate action.yml
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          with open("action.yml") as fh:
+              meta = yaml.safe_load(fh)
+
+          errors = []
+          for field in ("name", "description", "runs"):
+              if not meta.get(field):
+                  errors.append(f"action.yml is missing the required `{field}` field")
+
+          branding = meta.get("branding") or {}
+          for field in ("icon", "color"):
+              if not branding.get(field):
+                  errors.append(f"action.yml is missing `branding.{field}`, which the Marketplace requires")
+
+          declared = set(meta.get("outputs", {}))
+          expected = {"version", "version-url", "sbom-name", "release-status", "created", "components"}
+          if declared != expected:
+              errors.append(f"declared outputs {sorted(declared)} do not match the documented set {sorted(expected)}")
+
+          inputs = meta.get("inputs") or {}
+          expected_inputs = {
+              "api-url", "client-id", "client-secret", "sbom-name", "version",
+              "release-status", "components", "components-file",
+              "base-version", "bom-ref", "note", "hotfix-flag", "compliance-status",
+              "lifecycles", "deployed-envs", "external-references", "if-exists",
+          }
+          if set(inputs) != expected_inputs:
+              errors.append(f"declared inputs {sorted(inputs)} do not match the documented set {sorted(expected_inputs)}")
+
+          for name, spec in inputs.items():
+              if not (spec or {}).get("description"):
+                  errors.append(f"input `{name}` has no description")
+              # Every default resolves in the action so the ARTEFACTFLOW_ variables stay reachable; a `default:` here would make the runner substitute one first and silently break that.
+              if "default" in (spec or {}):
+                  errors.append(f"input `{name}` must not declare a default, because it would shadow the {name.replace('-', '_').upper()} environment variable")
+
+          if errors:
+              print("\n".join(f"::error::{e}" for e in errors))
+              sys.exit(1)
+          print("action.yml looks well-formed")
+          PY
+
+  smoke:
+    name: Smoke test
+    # Runs the action end to end against a stub API, so the wiring the unit tests cannot reach (input plumbing, $GITHUB_OUTPUT, the container entrypoint) is exercised on every change. It uses no secrets, so it also runs on pull requests from forks.
+    #
+    # Do not add service containers to this job. They would put the action on a per-job network, and the stub address resolved below assumes the default bridge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Once action.yml references a published image, `uses: ./` would pull that image and test the last release instead of this pull request, passing no matter what the diff does to the code. Staging a copy whose action.yml builds from the Dockerfile keeps the smoke test pointed at the source under review.
+      #
+      # A copy rather than an edit in place, so this never depends on when the runner reads the real action.yml.
+      - name: Stage a source-built copy of the action
+        run: |
+          mkdir -p ci-local-action
+          cp -R action.yml Dockerfile .dockerignore go.mod cmd internal ci-local-action/
+          python3 - <<'PY'
+          import re
+          path = "ci-local-action/action.yml"
+          with open(path) as fh:
+              content = fh.read()
+          patched, count = re.subn(r"(?m)^(\s*image:\s*).*$", r"\1'Dockerfile'", content)
+          if count != 1:
+              raise SystemExit(f"::error::expected exactly one `image:` line in action.yml, found {count}")
+          with open(path, "w") as fh:
+              fh.write(patched)
+          PY
+
+      - name: Start stub API
+        id: stub
+        run: |
+          # The stub binds every interface: the action runs in a container, so it reaches this over the docker bridge rather than on the loopback it would otherwise get. Its log goes to a file: a background process holding the step's stdout open can hang the job.
+          python3 testdata/stub-api.py 8080 >/tmp/stub.log 2>&1 &
+
+          gateway="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
+          echo "api-url=http://${gateway}:8080" >> "$GITHUB_OUTPUT"
+
+          # Prove the address works from inside a container before the action depends on it, so a networking change fails here with an obvious message instead of surfacing as a confusing action error.
+          for _ in $(seq 1 20); do
+            if docker run --rm curlimages/curl:latest -sf -X POST \
+                -H 'Content-Type: application/json' \
+                -d '{"client_id":"0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0","client_secret":"afsa_stub-client-secret"}' \
+                "http://${gateway}:8080/v1/auth/token" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::stub API was not reachable from a container at http://${gateway}:8080"
+          exit 1
+
+      # The headline case: a name and a SemVer, nothing else. Every artefact in the SBOM auto-resolves, and the assertions below check that the action reports what was captured, which is the only way a caller can find out.
+      - name: Publish an SBOM version with everything auto-resolved
+        id: publish
+        uses: ./ci-local-action
+        with:
+          api-url: ${{ steps.stub.outputs.api-url }}
+          client-id: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          client-secret: afsa_stub-client-secret
+          sbom-name: acme-platform
+          version: 2.0.0
+          note: Smoke test from CI.
+
+      - name: Assert outputs
+        env:
+          VERSION: ${{ steps.publish.outputs.version }}
+          VERSION_URL: ${{ steps.publish.outputs.version-url }}
+          SBOM_NAME: ${{ steps.publish.outputs.sbom-name }}
+          RELEASE_STATUS: ${{ steps.publish.outputs.release-status }}
+          CREATED: ${{ steps.publish.outputs.created }}
+          COMPONENTS: ${{ steps.publish.outputs.components }}
+        run: |
+          fail=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::output $1 = '$2', expected '$3'"
+              fail=1
+            fi
+          }
+          check version "$VERSION" "2.0.0"
+          check sbom-name "$SBOM_NAME" "acme-platform"
+          # `released` is this action's default rather than the API's, which is `draft`.
+          check release-status "$RELEASE_STATUS" "released"
+          check created "$CREATED" "true"
+          case "$VERSION_URL" in
+            http*/v1/sboms/acme-platform/versions/2.0.0) ;;
+            *) echo "::error::output version-url = '$VERSION_URL', expected the version's API URL"; fail=1 ;;
+          esac
+          # Every artefact in the SBOM must be reported, not only the pinned ones.
+          count="$(printf '%s' "$COMPONENTS" | jq 'length')"
+          check components.length "$count" "3"
+          exit $fail
+
+      # A partial pin is a set of overrides, not a subset: the artefacts it does not name are still captured, auto-resolved. Getting this backwards would produce a release SBOM that silently omits most of the platform, so it is asserted rather than assumed.
+      #
+      # This step is also configured entirely through the ARTEFACTFLOW_ environment variables rather than `with:`. Nothing but a real runner tells us whether step-level env reaches a container action.
+      - name: Publish a version pinning one artefact
+        id: partial
+        uses: ./ci-local-action
+        env:
+          ARTEFACTFLOW_API_URL: ${{ steps.stub.outputs.api-url }}
+          ARTEFACTFLOW_CLIENT_ID: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          ARTEFACTFLOW_CLIENT_SECRET: afsa_stub-client-secret
+          ARTEFACTFLOW_SBOM_NAME: acme-platform
+          ARTEFACTFLOW_VERSION: 2.0.1
+          ARTEFACTFLOW_COMPONENTS: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a8301=1.0.0
+
+      - name: Assert the unpinned artefacts were still captured
+        env:
+          COMPONENTS: ${{ steps.partial.outputs.components }}
+        run: |
+          fail=0
+          count="$(printf '%s' "$COMPONENTS" | jq 'length')"
+          [ "$count" = "3" ] || { echo "::error::a partial pin captured $count component(s), expected all 3"; fail=1; }
+          pinned="$(printf '%s' "$COMPONENTS" | jq -r '.[] | select(.artefact_id=="0198e2c3-9a21-7b8e-90f5-6c1d4e2a8301") | .version')"
+          [ "$pinned" = "1.0.0" ] || { echo "::error::pinned artefact resolved to '$pinned', expected 1.0.0"; fail=1; }
+          exit $fail
+
+      # The default is `fail`, and a workflow relying on that must actually see a failed step.
+      - name: Re-publish an existing version, expecting failure
+        id: conflict
+        continue-on-error: true
+        uses: ./ci-local-action
+        with:
+          api-url: ${{ steps.stub.outputs.api-url }}
+          client-id: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          client-secret: afsa_stub-client-secret
+          sbom-name: acme-platform
+          version: 2.0.0
+
+      - name: Assert the conflict failed the step
+        run: |
+          if [ "${{ steps.conflict.outcome }}" != "failure" ]; then
+            echo "::error::publishing an existing version succeeded; it must fail unless if-exists is skip"
+            exit 1
+          fi
+
+      - name: Re-publish the same version with if-exists skip
+        id: republish
+        uses: ./ci-local-action
+        with:
+          api-url: ${{ steps.stub.outputs.api-url }}
+          client-id: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          client-secret: afsa_stub-client-secret
+          sbom-name: acme-platform
+          version: 2.0.0
+          if-exists: skip
+
+      - name: Assert the skip was tolerated and reported honestly
+        env:
+          CREATED: ${{ steps.republish.outputs.created }}
+          COMPONENTS: ${{ steps.republish.outputs.components }}
+        run: |
+          fail=0
+          [ "$CREATED" = "false" ] || { echo "::error::created = '$CREATED', expected 'false'"; fail=1; }
+          # This run resolved nothing, so it must not claim a component set. An empty JSON array would be a claim that the release captured nothing.
+          [ -z "$COMPONENTS" ] || { echo "::error::components = '$COMPONENTS', expected an empty value when nothing was resolved"; fail=1; }
+          exit $fail
+
+      # An SBOM permits one draft at a time, and a second one is a 409 whose remedy is completely different from a duplicate version's. Two drafts in a row prove the action distinguishes them.
+      - name: Create the SBOM's one permitted draft
+        uses: ./ci-local-action
+        with:
+          api-url: ${{ steps.stub.outputs.api-url }}
+          client-id: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          client-secret: afsa_stub-client-secret
+          sbom-name: acme-platform
+          version: 2.1.0
+          release-status: draft
+
+      - name: Create a second draft, expecting failure
+        id: second-draft
+        continue-on-error: true
+        uses: ./ci-local-action
+        with:
+          api-url: ${{ steps.stub.outputs.api-url }}
+          client-id: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          client-secret: afsa_stub-client-secret
+          sbom-name: acme-platform
+          version: 2.2.0
+          release-status: draft
+          # `skip` covers a version that already exists, and must not swallow this: version 2.2.0 was never created.
+          if-exists: skip
+
+      - name: Assert the outstanding draft failed the step
+        run: |
+          if [ "${{ steps.second-draft.outcome }}" != "failure" ]; then
+            echo "::error::a second draft succeeded; only one draft may exist per SBOM, and if-exists: skip must not hide that"
+            exit 1
+          fi
+
+      # A release refused by a blocking policy is also a 409, and the stub answers it with the API's real code. `skip` must not turn it into a passing step: the version was never created.
+      - name: Release a version the policies block, expecting failure
+        id: blocked
+        continue-on-error: true
+        uses: ./ci-local-action
+        with:
+          api-url: ${{ steps.stub.outputs.api-url }}
+          client-id: 0198e2c3-9a21-7b8e-90f5-6c1d4e2a83b0
+          client-secret: afsa_stub-client-secret
+          sbom-name: acme-platform
+          version: 9.0.0
+          if-exists: skip
+
+      - name: Assert the blocked release failed the step
+        run: |
+          if [ "${{ steps.blocked.outcome }}" != "failure" ]; then
+            echo "::error::a release blocked by a policy succeeded; if-exists: skip must only tolerate a version that already exists"
+            exit 1
+          fi
