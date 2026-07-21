@@ -1,0 +1,15 @@
+{
+  "components": [
+    {
+      "artefact_id": "0123456789abcdef01234567",
+      "version_id": "1.4.2"
+    },
+    {
+      "artefact_id": "89abcdef0123456789abcdef",
+      "version_id": "0.9.0-rc.1"
+    },
+    {
+      "artefact_id": "fedcba9876543210fedcba98"
+    }
+  ]
+}
