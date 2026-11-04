@@ -1,6 +1,6 @@
 # Marketplace requires action.yml at the repository root, which is why this action lives in its own repository.
 name: 'ArtefactFlow Publish SBOM Version'
-description: 'Create a version of an ArtefactFlow SBOM from your release pipeline, capturing which artefact versions belong together in this release.'
+description: 'Create an ArtefactFlow SBOM version from your release pipeline, capturing which artefact versions belong together.'
 author: 'ArtefactFlow'
 
 branding:
@@ -85,4 +85,4 @@ runs:
   # One exact, immutable image version, published by the release workflow and bumped as part of cutting each release.
   #
   # Exact, not a floating `:1`. A consumer who pins `uses: ...@v1.2.0` or a commit SHA expects to keep running that code; a floating tag would silently hand them a newer image and make pinning meaningless. The release workflow refuses to publish if this reference and the release tag disagree.
-  image: 'docker://ghcr.io/artefactflow/publish-sbomversion-action:1.0.0'
+  image: 'docker://ghcr.io/artefactflow/publish-sbomversion-action:1.0.1'
